@@ -1,5 +1,5 @@
 name: Polymarket BTC Bot
-
+# Trigger comment to force GitHub Actions detection
 on:
   schedule:
     # Läuft exakt alle 5 Minuten (UTC)
