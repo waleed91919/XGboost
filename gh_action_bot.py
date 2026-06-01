@@ -70,27 +70,29 @@ def fetch_mempool_onchain_history():
     return pd.DataFrame(data).set_index('time').sort_index()
 
 def calculate_live_features(df_binance, df_onchain):
+    """Berechnet Features exakt wie im Training."""
     df = df_binance.copy()
     
-    # Mikrostruktur
+    # 1. Mikrostruktur
     df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
     df['date_only'] = df.index.date
     df['vol_price'] = df['typical_price'] * df['volume']
     df['cum_vol'] = df.groupby('date_only')['volume'].cumsum()
     df['cum_vol_price'] = df.groupby('date_only')['vol_price'].cumsum()
-    df['vwap'] = df['cum_vol_price'] / df['cum_vol']
-    df['dist_to_vwap'] = (df['close'] - df['vwap']) / df['vwap']
+    df['vwap'] = df['cum_vol_price'] / (df['cum_vol'] + 1e-8)
+    df['dist_to_vwap'] = (df['close'] - df['vwap']) / (df['vwap'] + 1e-8)
     
-    raw_money_flow = df['typical_price'] * df['volume']
-    pos_flow = pd.Series(np.where(df['typical_price'] > df['typical_price'].shift(1), raw_money_flow, 0), index=df.index)
-    neg_flow = pd.Series(np.where(df['typical_price'] < df['typical_price'].shift(1), raw_money_flow, 0), index=df.index)
+    typical_price = df['typical_price']
+    raw_money_flow = typical_price * df['volume']
+    pos_flow = pd.Series(np.where(typical_price > typical_price.shift(1), raw_money_flow, 0), index=df.index)
+    neg_flow = pd.Series(np.where(typical_price < typical_price.shift(1), raw_money_flow, 0), index=df.index)
     money_ratio = pos_flow.rolling(window=14).sum() / (neg_flow.rolling(window=14).sum() + 1e-8)
     df['mfi_14'] = 100 - (100 / (1 + money_ratio))
     
     sma_20 = df['close'].rolling(window=20).mean()
     std_20 = df['close'].rolling(window=20).std()
-    df['dist_to_bb_upper'] = (df['close'] - (sma_20 + 2*std_20)) / (sma_20 + 2*std_20)
-    df['dist_to_bb_lower'] = (df['close'] - (sma_20 - 2*std_20)) / (sma_20 - 2*std_20)
+    df['dist_to_bb_upper'] = (df['close'] - (sma_20 + 2*std_20)) / (sma_20 + 2*std_20 + 1e-8)
+    df['dist_to_bb_lower'] = (df['close'] - (sma_20 - 2*std_20)) / (sma_20 - 2*std_20 + 1e-8)
     
     df['buying_pressure'] = (((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low'] + 1e-8)) * df['volume']
     df['buying_pressure_ema_5'] = df['buying_pressure'].ewm(span=5, adjust=False).mean()
@@ -99,7 +101,7 @@ def calculate_live_features(df_binance, df_onchain):
     df['volatility_20'] = df['returns'].rolling(window=20).std()
     df['volatility_60'] = df['returns'].rolling(window=60).std()
     
-    # On-Chain Mapping
+    # 2. On-Chain Mapping
     df_onchain_resampled = df_onchain.reindex(df.index, method='ffill').bfill().fillna(0)
     df['total_fees_btc'] = df_onchain_resampled['fees']
     df['tx_count'] = df_onchain_resampled['txs']
@@ -115,7 +117,13 @@ def calculate_live_features(df_binance, df_onchain):
                 'buying_pressure_ema_5', 'returns', 'volatility_20', 'volatility_60',
                 'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg']
     
-    return df[features].iloc[-1:].ffill().fillna(0)
+    # Sicherstellen, dass wir Daten haben und NAs füllen
+    df_feats = df[features].fillna(0).replace([np.inf, -np.inf], 0)
+    
+    if len(df_feats) == 0:
+        return None
+        
+    return df_feats.iloc[-1:] # Nehme die allerletzte Zeile (aktuellster Status)
 
 # ==============================================================================
 # 🏛️ POLYMARKET API
@@ -124,13 +132,13 @@ def calculate_live_features(df_binance, df_onchain):
 def get_active_btc_markets():
     params = {"active": "true", "closed": "false", "search": "Bitcoin Price", "limit": 10}
     try:
-        response = requests.get(f"{GAMMA_API}/markets", params=params)
+        response = requests.get(f"{GAMMA_API}/markets", params=params, timeout=15)
         return [m for m in response.json() if "Bitcoin" in m['question']]
     except: return []
 
 def get_live_orderbook(token_id):
     try:
-        response = requests.get(f"{CLOB_API}/book", params={"token_id": token_id})
+        response = requests.get(f"{CLOB_API}/book", params={"token_id": token_id}, timeout=15)
         return response.json()
     except: return None
 
@@ -142,21 +150,36 @@ def main():
     print(f"--- ⏱️ GitHub Action Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
     
     # 1. Init
-    model, scaler = load_artifacts()
+    try:
+        model, scaler = load_artifacts()
+    except Exception as e:
+        print(f"❌ Fehler beim Laden der Artefakte: {e}")
+        return
+
     if not os.path.exists(LOG_FILE):
         pd.DataFrame(columns=['timestamp', 'market', 'prob', 'side', 'price', 'liquidity', 'kelly_bet']).to_csv(LOG_FILE, index=False)
 
     # 2. Daten holen
-    df_binance = fetch_binance_5m()
-    df_onchain = fetch_mempool_onchain_history()
+    try:
+        df_binance = fetch_binance_5m()
+        df_onchain = fetch_mempool_onchain_history()
+    except Exception as e:
+        print(f"❌ Fehler beim Datenabruf: {e}")
+        return
     
-    if df_binance is None or df_onchain is None:
-        print("⚠️ Keine Daten verfügbar.")
+    if df_binance is None or df_onchain is None or len(df_binance) < 60:
+        print("⚠️ Nicht genügend Daten für Feature-Engineering.")
         return
 
     # 3. Features & Inferenz
     X_live = calculate_live_features(df_binance, df_onchain)
-    # FIX: .values nutzen um Feature-Names Warning zu vermeiden
+    
+    if X_live is None or X_live.empty:
+        print("⚠️ Feature DataFrame ist leer.")
+        return
+
+    print(f"📊 Feature-Check: Shape {X_live.shape}")
+    
     X_scaled = scaler.transform(X_live.values)
     prob_up = model.predict_proba(X_scaled)[:, 1][0]
     print(f"🔮 Modell Vorhersage (UP): {prob_up:.2%}")
