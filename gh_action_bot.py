@@ -117,13 +117,18 @@ def calculate_live_features(df_binance, df_onchain):
                 'buying_pressure_ema_5', 'returns', 'volatility_20', 'volatility_60',
                 'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg']
     
-    # Sicherstellen, dass wir Daten haben und NAs füllen
-    df_feats = df[features].fillna(0).replace([np.inf, -np.inf], 0)
+    # Sicherstellen, dass wir keine NaN-Werte haben und NAs füllen
+    df_feats = df[features].ffill().dropna()
     
-    if len(df_feats) == 0:
+    print(f"📊 Debug: Feature DataFrame Shape {df_feats.shape}")
+    if not df_feats.empty:
+        print(f"📊 Letzter Zeitstempel im Feature-Set: {df_feats.index[-1]}")
+    
+    if df_feats.empty:
+        print("⚠️ Feature DataFrame ist nach dropna() leer.")
         return None
         
-    return df_feats.iloc[-1:] # Nehme die allerletzte Zeile (aktuellster Status)
+    return df_feats.tail(1) # Sicherere Methode als iloc[-1:] falls wir nur 1 Zeile haben
 
 # ==============================================================================
 # 🏛️ POLYMARKET API
