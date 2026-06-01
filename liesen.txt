@@ -1,0 +1,27 @@
+Wir ändern jetzt die Architektur! Anstatt den Bot lokal in einer Endlosschleife laufen zu lassen, werden wir ihn als serverlosen Cron-Job über "GitHub Actions" bereitstellen. Das ist professionelles MLOps, läuft 24/7 und benötigt keine laufenden lokalen Server.
+
+Deine Aufgabe ist es, mir den exakten Code für die folgenden 3 Dateien zu generieren:
+
+1. Das neue Ausführungs-Skript (gh_action_bot.py):
+
+    Nimm die funktionierende Logik aus unserem Live-Bot, aber entferne alle while True-Schleifen und time.sleep()-Befehle. Das Skript darf pro Aufruf nur exakt einmal durchlaufen (Daten holen -> Features berechnen -> Inferenz -> ggf. CSV updaten -> Beenden).
+
+    KRITISCHE BUGFIXES: Du musst die zwei Warnungen aus dem letzten Testlauf beheben:
+    a) Beim Skalieren: Nutze .values (z.B. scaler.transform(live_features_df.values)), um den Scikit-Learn Feature-Names Warning zu beheben.
+    b) Bei der Inferenz: GitHub Actions Server haben keine GPUs. Um den DMatrix-Fallback und extreme Latenzen zu verhindern, musst du zwingend model.set_param({"device": "cpu"}) direkt nach dem Laden des XGBoost-Modells einfügen.
+
+2. Die Abhängigkeiten (requirements.txt):
+
+    Erstelle eine Liste aller benötigten Pakete, damit der GitHub-Runner weiß, was er installieren muss (pandas, xgboost, scikit-learn, joblib, requests, etc.).
+
+3. Der Automatisierungs-Workflow (.github/workflows/bot.yml):
+
+    Schreibe den YAML-Code für GitHub Actions.
+
+    Trigger: Ein Cron-Job, der exakt alle 5 Minuten läuft (cron: '*/5 * * * *'), plus workflow_dispatch für manuelle Tests.
+
+    Steps: Checkout Repo -> Setup Python -> Install requirements.txt -> Run gh_action_bot.py.
+
+    Wichtigster Step (Auto-Commit): Wenn das Skript einen neuen Trade in der paper_trades_log.csv speichert, muss der Workflow diese Änderung erkennen und via git add, git commit und git push automatisch ins Repository pushen, damit nichts verloren geht.
+
+Generiere jetzt den Code für diese 3 Dateien, damit ich das Repo auf GitHub hochladen und den Bot aktivieren kann!

@@ -1,0 +1,1 @@
+{"features": ["dist_to_vwap", "mfi_14", "dist_to_bb_upper", "dist_to_bb_lower", "buying_pressure_ema_5", "returns", "volatility_20", "volatility_60", "fee_momentum_ratio", "tx_1h_sum", "blocksize_1h_avg"], "target": "target", "threshold_tested": 0.601, "accuracy": 0.5268203570096378, "n_samples": 846384}
