@@ -111,7 +111,7 @@ def calculate_live_features(df_binance, df_onchain):
     df['volatility_60'] = df['returns'].rolling(window=60).std()
     
     # 2. On-Chain Mapping
-    df_onchain_resampled = df_onchain.reindex(df.index, method='ffill').fillna(method='bfill').fillna(0)
+    df_onchain_resampled = df_onchain.reindex(df.index, method='ffill').bfill().fillna(0)
     df['total_fees_btc'] = df_onchain_resampled['fees']
     df['tx_count'] = df_onchain_resampled['txs']
     df['avg_block_size'] = df_onchain_resampled['size']
