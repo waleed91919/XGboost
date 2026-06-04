@@ -11,11 +11,16 @@ from datetime import datetime, timedelta
 # ==============================================================================
 # ⚙️ KONFIGURATION
 # ==============================================================================
-MODEL_PATH = 'xgboost_polymarket.pkl'
+BASE_MODEL_PATH = 'xgboost_polymarket.pkl'
+META_MODEL_PATH = 'xgboost_risk_manager.pkl'
 SCALER_PATH = 'robust_scaler.pkl'
 LOG_FILE = 'paper_trades_log.csv'
-CONFIDENCE_THRESHOLD = 0.55  # TEST-THRESHOLD (Später wieder auf 0.601)
-FRACTIONAL_KELLY = 0.2
+
+# Thresholds aus Backtest-Optimierung
+CONFIDENCE_THRESHOLD = 0.580    # Basis-Modell Threshold
+META_THRESHOLD = 0.600          # Meta-Modell (Risk Manager) Threshold
+
+FRACTIONAL_KELLY = 0.25         # Quarter-Kelly
 INITIAL_CAPITAL = 10000.0
 
 # API Endpoints
@@ -24,25 +29,30 @@ CLOB_API = "https://clob.polymarket.com"
 BINANCE_API = "https://api.binance.com/api/v3/klines"
 MEMPOOL_API = "https://mempool.space/api"
 
-print("🚀 Polymarket Live Paper-Bot (v2 - Fixed History) gestartet...")
+print("🚀 Polymarket Dual-Model Live Bot (v5 - AI Risk Manager) gestartet...")
 
 # ==============================================================================
 # 🛠️ DATA FETCHING & FEATURE ENGINEERING
 # ==============================================================================
 
 def load_artifacts():
-    with open(MODEL_PATH, 'rb') as f:
-        model = pickle.load(f)
-    # Erzwinge CPU für Inferenz (verhindert DMatrix Fallback & reduziert Latenz bei 1 Zeile)
-    model.set_params(device="cpu")
+    with open(BASE_MODEL_PATH, 'rb') as f:
+        base_model = pickle.load(f)
+    base_model.set_params(device="cpu") # CPU für Live-Inferenz
+    
+    with open(META_MODEL_PATH, 'rb') as f:
+        meta_model = pickle.load(f)
+    meta_model.set_params(device="cpu") # CPU für Live-Inferenz
+    
     with open(SCALER_PATH, 'rb') as f:
         scaler = pickle.load(f)
-    print("✅ Modell und Scaler geladen.")
-    return model, scaler
+        
+    print("✅ Basis-Modell, Risk Manager und Scaler geladen.")
+    return base_model, meta_model, scaler
 
 def fetch_binance_5m():
-    """Holt die letzten 100 5m-Kerzen von Binance."""
-    params = {"symbol": "BTCUSDT", "interval": "5m", "limit": 100}
+    """Holt die letzten 300 5m-Kerzen von Binance (24h+ History)."""
+    params = {"symbol": "BTCUSDT", "interval": "5m", "limit": 300}
     try:
         response = requests.get(BINANCE_API, params=params, timeout=10)
         data = response.json()
@@ -79,7 +89,7 @@ def fetch_mempool_onchain_history():
         return None
 
 def calculate_live_features(df_binance, df_onchain):
-    """Berechnet Features exakt wie im Training."""
+    """Berechnet Features für beide Modelle."""
     df = df_binance.copy()
     
     # 1. Mikrostruktur
@@ -110,7 +120,7 @@ def calculate_live_features(df_binance, df_onchain):
     df['volatility_20'] = df['returns'].rolling(window=20).std()
     df['volatility_60'] = df['returns'].rolling(window=60).std()
     
-    # 2. On-Chain Mapping
+    # 2. On-Chain Mapping (Resampled)
     df_onchain_resampled = df_onchain.reindex(df.index, method='ffill').bfill().fillna(0)
     df['total_fees_btc'] = df_onchain_resampled['fees']
     df['tx_count'] = df_onchain_resampled['txs']
@@ -121,12 +131,69 @@ def calculate_live_features(df_binance, df_onchain):
     df['fee_momentum_ratio'] = fees_1h_sum / ((fees_4h_sum / 4) + 1e-8)
     df['tx_1h_sum'] = df['tx_count'].rolling(window=12, min_periods=1).sum()
     df['blocksize_1h_avg'] = df['avg_block_size'].rolling(window=12, min_periods=1).mean()
+
+    # 3. ATR (für Risk Manager)
+    high_low = df['high'] - df['low']
+    high_cp = np.abs(df['high'] - df['close'].shift())
+    low_cp = np.abs(df['low'] - df['close'].shift())
+    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+    df['atr_14'] = tr.rolling(window=14).mean()
     
-    features = ['dist_to_vwap', 'mfi_14', 'dist_to_bb_upper', 'dist_to_bb_lower', 
-                'buying_pressure_ema_5', 'returns', 'volatility_20', 'volatility_60',
-                'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg']
+    base_features = ['dist_to_vwap', 'mfi_14', 'dist_to_bb_upper', 'dist_to_bb_lower', 
+                    'buying_pressure_ema_5', 'returns', 'volatility_20', 'volatility_60',
+                    'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg']
     
-    return df[features].iloc[-1:].ffill().fillna(0)
+    return df.iloc[-1:], base_features
+
+
+# ==============================================================================
+# 📊 TRADE RESOLUTION LOGIC
+# ==============================================================================
+
+def resolve_trades(current_btc_price):
+    """Überprüft offene Trades und rechnet sie ab."""
+    if not os.path.exists(LOG_FILE):
+        return
+        
+    try:
+        df = pd.read_csv(LOG_FILE)
+        if df.empty: return
+        
+        updated = False
+        for i, row in df.iterrows():
+            if row['status'] == 'OPEN':
+                trade_time = pd.to_datetime(row['timestamp'])
+                # Wenn der Trade älter als 5 Minuten ist (Kerze geschlossen)
+                if datetime.now() - trade_time > timedelta(minutes=5):
+                    entry_btc = float(row['entry_btc_price'])
+                    side = row['side']
+                    bet_amount = float(row['kelly_bet'])
+                    polymarket_entry_price = float(row['price'])
+                    
+                    b = (1.0 - polymarket_entry_price) / (polymarket_entry_price + 1e-8)
+                    
+                    is_win = False
+                    if side == 'YES' and current_btc_price > entry_btc:
+                        is_win = True
+                    elif side == 'NO' and current_btc_price < entry_btc:
+                        is_win = True
+                        
+                    if is_win:
+                        df.at[i, 'status'] = 'WON'
+                        df.at[i, 'pnl'] = bet_amount * b
+                    else:
+                        df.at[i, 'status'] = 'LOST'
+                        df.at[i, 'pnl'] = -bet_amount
+                        
+                    df.at[i, 'exit_price'] = current_btc_price
+                    updated = True
+                    print(f"✅ Trade aufgelöst: {row['market']} | {df.at[i, 'status']} | PnL: {df.at[i, 'pnl']:.2f} USDT")
+        
+        if updated:
+            df.to_csv(LOG_FILE, index=False)
+            
+    except Exception as e:
+        print(f"❌ Fehler bei Trade Resolution: {e}")
 
 # ==============================================================================
 # 🏛️ POLYMARKET API
@@ -150,11 +217,12 @@ def get_live_orderbook(token_id):
 # ==============================================================================
 
 def run_bot():
-    model, scaler = load_artifacts()
+    base_model, meta_model, scaler = load_artifacts()
     capital = INITIAL_CAPITAL
     
     if not os.path.exists(LOG_FILE):
-        pd.DataFrame(columns=['timestamp', 'market', 'prob', 'side', 'price', 'liquidity', 'kelly_bet']).to_csv(LOG_FILE, index=False)
+        cols = ['timestamp', 'market', 'prob', 'meta_prob', 'side', 'price', 'liquidity', 'kelly_bet', 'entry_btc_price', 'exit_price', 'status', 'pnl']
+        pd.DataFrame(columns=cols).to_csv(LOG_FILE, index=False)
 
     while True:
         now = datetime.now()
@@ -168,47 +236,86 @@ def run_bot():
             time.sleep(10)
             continue
             
-        # 2. Features berechnen & Skalieren
-        X_live = calculate_live_features(df_binance, df_onchain)
-        X_scaled = scaler.transform(X_live.values)
+        current_btc_price = df_binance.iloc[-1]['close']
         
-        # 3. Modell-Vorhersage
-        prob_up = model.predict_proba(X_scaled)[:, 1][0]
-        print(f"🔮 Modell Vorhersage (UP): {prob_up:.2%}")
+        # 2. Trade Resolution
+        resolve_trades(current_btc_price)
         
-        # 4. Polymarket Check
-        markets = get_active_btc_markets()
-        for market in markets:
-            market_question = market['question']
-            token_ids = market.get('clobTokenIds', [])
-            if len(token_ids) < 2: continue
+        # 3. Features berechnen
+        row_live, base_features = calculate_live_features(df_binance, df_onchain)
+        
+        # 4. Inferenz Stufe 1: Basis-Modell
+        X_scaled = scaler.transform(row_live[base_features].values)
+        base_prob = base_model.predict_proba(X_scaled)[:, 1][0]
+        print(f"🔮 Basis-Modell (UP): {base_prob:.2%}")
+        
+        # 5. Signal & Risk Management
+        if base_prob > CONFIDENCE_THRESHOLD:
+            # Stufe 2: Meta-Modell (Risk Manager)
+            meta_features = [
+                'atr_14', 'volume', 'volatility_20', 'volatility_60', 
+                'dist_to_bb_upper', 'dist_to_bb_lower',
+                'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg'
+            ]
+            # Meta-Features vorbereiten (base_prob hinzufügen)
+            X_meta_dict = row_live[meta_features].to_dict('records')[0]
+            X_meta_dict['base_prob'] = base_prob
             
-            if prob_up >= CONFIDENCE_THRESHOLD:
-                token_id, side, confidence = token_ids[0], "YES", prob_up
-            elif (1-prob_up) >= CONFIDENCE_THRESHOLD:
-                token_id, side, confidence = token_ids[1], "NO", 1 - prob_up
-            else: continue
-                
-            book = get_live_orderbook(token_id)
-            if book and book.get('asks'):
-                best_ask = float(book['asks'][0]['price'])
-                size_available = float(book['asks'][0]['size'])
-                
-                # Kelly (EV Check)
-                b = (1.0 - best_ask) / best_ask
-                q = 1.0 - confidence
-                kelly_pct = (confidence * b - q) / (b + 1e-8)
-                bet_amount = capital * min(max(kelly_pct * FRACTIONAL_KELLY, 0), 0.10)
-                
-                if bet_amount > 0 and (size_available * best_ask) >= bet_amount:
-                    print(f"🎯 TRADING SIGNAL! {side} @ {best_ask} for {market_question}")
-                    log_entry = {'timestamp': datetime.now(), 'market': market_question, 'prob': confidence,
-                                 'side': side, 'price': best_ask, 'liquidity': size_available, 'kelly_bet': bet_amount}
-                    pd.DataFrame([log_entry]).to_csv(LOG_FILE, mode='a', header=False, index=False)
-                    print(f"📝 Paper-Trade geloggt!")
-                else:
-                    print(f"💤 Signal ({confidence:.1%}) vorhanden, aber Liquidität zu gering oder kein EV.")
+            # Sortierung der Features für Meta-Modell sicherstellen (muss 1:1 wie im Training sein)
+            meta_feature_order = [
+                'base_prob', 'atr_14', 'volume', 'volatility_20', 'volatility_60', 
+                'dist_to_bb_upper', 'dist_to_bb_lower',
+                'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg'
+            ]
+            X_meta_values = np.array([[X_meta_dict[f] for f in meta_feature_order]])
             
+            meta_prob = meta_model.predict_proba(X_meta_values)[:, 1][0]
+            print(f"🛡️ Risk Manager Konfidenz: {meta_prob:.2%}")
+            
+            if meta_prob > META_THRESHOLD:
+                # Polymarket Check
+                markets = get_active_btc_markets()
+                for market in markets:
+                    market_question = market['question']
+                    token_ids = market.get('clobTokenIds', [])
+                    if len(token_ids) < 2: continue
+                    
+                    token_id, side = token_ids[0], "YES"
+                    book = get_live_orderbook(token_id)
+                    
+                    if book and book.get('asks'):
+                        best_ask = float(book['asks'][0]['price'])
+                        size_available = float(book['asks'][0]['size'])
+                        
+                        # Kelly (EV Check)
+                        b = (1.0 - best_ask) / (best_ask + 1e-8)
+                        q = 1.0 - base_prob
+                        kelly_pct = (base_prob * b - q) / (b + 1e-8)
+                        bet_amount = capital * min(max(kelly_pct * FRACTIONAL_KELLY, 0), 0.10)
+                        
+                        if bet_amount > 0 and (size_available * best_ask) >= bet_amount:
+                            print(f"🎯 TRADING SIGNAL! {side} @ {best_ask} for {market_question}")
+                            log_entry = {
+                                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'market': market_question, 
+                                'prob': base_prob,
+                                'meta_prob': meta_prob,
+                                'side': side, 
+                                'price': best_ask, 
+                                'liquidity': size_available, 
+                                'kelly_bet': bet_amount,
+                                'entry_btc_price': current_btc_price,
+                                'exit_price': 0.0,
+                                'status': 'OPEN',
+                                'pnl': 0.0
+                            }
+                            pd.DataFrame([log_entry]).to_csv(LOG_FILE, mode='a', header=False, index=False)
+                            print(f"📝 Paper-Trade geloggt! (Entry BTC: {current_btc_price})")
+                        else:
+                            print(f"💤 Signal vorhanden, aber Liquidität zu gering oder kein EV.")
+            else:
+                print(f"⚠️ Risk Manager blockiert Trade (Konfidenz {meta_prob:.2%} <= {META_THRESHOLD:.2%})")
+        
         # Nächster Check in 30 Sekunden
         time.sleep(30)
 
