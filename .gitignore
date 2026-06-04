@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+ENV/
+env/
+
+# Data & Models (GitHub 100MB limit)
+*.csv
+!paper_trades_log.csv
+*.pkl
+*.json
+*.sql
+*.txt
+!requirements.txt
+
+# OS generated files
+.DS_Store
+Thumbs.db
