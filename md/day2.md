@@ -38,3 +38,19 @@
 - **Features:** 24h ATR monitoring, 58% confidence anchor, and strict "YES-only" execution.
 - **Ready:** System is primed for live paper-trading.
 
+## 7. The Dual-Model Breakthrough: AI Risk Management
+- **Massive Data Cleaning:** Developed `clean_massive_data.py` to fix on-chain gaps in the 8-year dataset (**2017-2025**). Used `BTCUSDT_5m_enriched_clean.csv` for training.
+- **Meta-Labeling Training:** 
+  - Created `train_meta_model.py`.
+  - Trained an **XGBoost Risk Manager** on 8,000+ trades to distinguish between "True Wins" and "Loss Traps".
+  - Features: Basis-Probability, ATR, Volume, Volatility, and On-Chain Momentum.
+- **Dual-Model Backtest (`meta_backtest.py`):**
+  - Combined the Base Model (58% Threshold) with the Meta Model (60% Threshold).
+  - **Record Result:** **+46.37% PnL** over 90 days.
+  - **Win-Rate:** **68.85%** (blocked 18 low-quality trades).
+
+## 8. Final Deployment & GitHub
+- **Production Bot:** `polymarket_live_bot.py` (v5) implements the full Ensemble Architecture.
+- **Cloud Ready:** Optimized for CPU inference with robust logging.
+- **Repository:** Project secured on GitHub with a surgical `.gitignore` to handle large datasets and model artifacts.
+
