@@ -8,13 +8,14 @@ venv/
 ENV/
 env/
 
-# Data & Models (GitHub 100MB limit)
+# Data & Models
 *.csv
 !paper_trades_log.csv
-*.pkl
-*.json
-*.sql
-*.txt
+# Allow model artifacts and config
+!*.pkl
+!*.json
+!*.sql
+!*.txt
 !requirements.txt
 
 # OS generated files
