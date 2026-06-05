@@ -13,12 +13,15 @@ from datetime import datetime, timedelta
 # ==============================================================================
 BASE_MODEL_PATH = 'xgboost_polymarket.pkl'
 META_MODEL_PATH = 'xgboost_risk_manager.pkl'
+KMEANS_MODEL_PATH = 'kmeans_model.pkl'
 SCALER_PATH = 'robust_scaler.pkl'
+KMEANS_SCALER_PATH = 'kmeans_scaler.pkl'
 LOG_FILE = 'paper_trades_log.csv'
 
 # Thresholds aus Backtest-Optimierung
 CONFIDENCE_THRESHOLD = 0.580    # Basis-Modell Threshold
-META_THRESHOLD = 0.600          # Meta-Modell (Risk Manager) Threshold
+META_THRESHOLD = 0.580          # Meta-Modell (Risk Manager) Threshold
+REGIME_BLOCK_ID = 3             # Regime ID, die blockiert wird (Panik/Hohe Vola)
 
 FRACTIONAL_KELLY = 0.25         # Quarter-Kelly
 INITIAL_CAPITAL = 10000.0
@@ -29,7 +32,7 @@ CLOB_API = "https://clob.polymarket.com"
 BINANCE_API = "https://api.binance.com/api/v3/klines"
 MEMPOOL_API = "https://mempool.space/api"
 
-print("🚀 Polymarket Dual-Model Live Bot (v5 - AI Risk Manager) gestartet...")
+print("🚀 Polymarket Triple-Check Live Bot (v6 - Regime Filter + AI Risk Manager) gestartet...")
 
 # ==============================================================================
 # 🛠️ DATA FETCHING & FEATURE ENGINEERING
@@ -44,11 +47,17 @@ def load_artifacts():
         meta_model = pickle.load(f)
     meta_model.set_params(device="cpu") # CPU für Live-Inferenz
     
+    with open(KMEANS_MODEL_PATH, 'rb') as f:
+        kmeans_model = pickle.load(f)
+        
     with open(SCALER_PATH, 'rb') as f:
         scaler = pickle.load(f)
         
-    print("✅ Basis-Modell, Risk Manager und Scaler geladen.")
-    return base_model, meta_model, scaler
+    with open(KMEANS_SCALER_PATH, 'rb') as f:
+        kmeans_scaler = pickle.load(f)
+        
+    print("✅ Basis-Modell, Risk Manager, K-Means und Scaler geladen.")
+    return base_model, meta_model, kmeans_model, scaler, kmeans_scaler
 
 def fetch_binance_5m():
     """Holt die letzten 300 5m-Kerzen von Binance (24h+ History)."""
@@ -89,7 +98,7 @@ def fetch_mempool_onchain_history():
         return None
 
 def calculate_live_features(df_binance, df_onchain):
-    """Berechnet Features für beide Modelle."""
+    """Berechnet Features für alle drei Modelle."""
     df = df_binance.copy()
     
     # 1. Mikrostruktur
@@ -132,7 +141,7 @@ def calculate_live_features(df_binance, df_onchain):
     df['tx_1h_sum'] = df['tx_count'].rolling(window=12, min_periods=1).sum()
     df['blocksize_1h_avg'] = df['avg_block_size'].rolling(window=12, min_periods=1).mean()
 
-    # 3. ATR (für Risk Manager)
+    # 3. ATR (für Risk Manager & Regime Filter)
     high_low = df['high'] - df['low']
     high_cp = np.abs(df['high'] - df['close'].shift())
     low_cp = np.abs(df['low'] - df['close'].shift())
@@ -143,7 +152,9 @@ def calculate_live_features(df_binance, df_onchain):
                     'buying_pressure_ema_5', 'returns', 'volatility_20', 'volatility_60',
                     'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg']
     
-    return df.iloc[-1:], base_features
+    regime_features = ['atr_14', 'volume', 'mfi_14', 'volatility_20', 'avg_block_size']
+    
+    return df.iloc[-1:], base_features, regime_features
 
 
 # ==============================================================================
@@ -217,11 +228,11 @@ def get_live_orderbook(token_id):
 # ==============================================================================
 
 def run_bot():
-    base_model, meta_model, scaler = load_artifacts()
+    base_model, meta_model, kmeans_model, scaler, kmeans_scaler = load_artifacts()
     capital = INITIAL_CAPITAL
     
     if not os.path.exists(LOG_FILE):
-        cols = ['timestamp', 'market', 'prob', 'meta_prob', 'side', 'price', 'liquidity', 'kelly_bet', 'entry_btc_price', 'exit_price', 'status', 'pnl']
+        cols = ['timestamp', 'market', 'prob', 'meta_prob', 'regime', 'side', 'price', 'liquidity', 'kelly_bet', 'entry_btc_price', 'exit_price', 'status', 'pnl']
         pd.DataFrame(columns=cols).to_csv(LOG_FILE, index=False)
 
     while True:
@@ -242,16 +253,27 @@ def run_bot():
         resolve_trades(current_btc_price)
         
         # 3. Features berechnen
-        row_live, base_features = calculate_live_features(df_binance, df_onchain)
+        row_live, base_features, regime_features = calculate_live_features(df_binance, df_onchain)
         
         # 4. Inferenz Stufe 1: Basis-Modell
         X_scaled = scaler.transform(row_live[base_features].values)
         base_prob = base_model.predict_proba(X_scaled)[:, 1][0]
         print(f"🔮 Basis-Modell (UP): {base_prob:.2%}")
         
-        # 5. Signal & Risk Management
+        # 5. Signal & Risk Management (Triple-Check)
         if base_prob > CONFIDENCE_THRESHOLD:
-            # Stufe 2: Meta-Modell (Risk Manager)
+            
+            # Stufe 2: Regime Filter
+            X_regime = kmeans_scaler.transform(row_live[regime_features].values)
+            regime_id = kmeans_model.predict(X_regime)[0]
+            print(f"🌐 Markt-Regime: {regime_id} {'⚠️ (PANIK/BLOCK)' if regime_id == REGIME_BLOCK_ID else '✅ (NORMAL)'}")
+            
+            if regime_id == REGIME_BLOCK_ID:
+                print(f"🛑 Regime-Filter blockiert Trade (Regime {regime_id})")
+                time.sleep(30)
+                continue
+                
+            # Stufe 3: Meta-Modell (Risk Manager)
             meta_features = [
                 'atr_14', 'volume', 'volatility_20', 'volatility_60', 
                 'dist_to_bb_upper', 'dist_to_bb_lower',
@@ -291,7 +313,7 @@ def run_bot():
                         b = (1.0 - best_ask) / (best_ask + 1e-8)
                         q = 1.0 - base_prob
                         kelly_pct = (base_prob * b - q) / (b + 1e-8)
-                        bet_amount = capital * min(max(kelly_pct * FRACTIONAL_KELLY, 0), 0.10)
+                        bet_amount = capital * min(max(kelly_pct * FRACTIONAL_KELLY, 0), 0.15) # Cap auf 15% erhöht wie im Backtest
                         
                         if bet_amount > 0 and (size_available * best_ask) >= bet_amount:
                             print(f"🎯 TRADING SIGNAL! {side} @ {best_ask} for {market_question}")
@@ -300,6 +322,7 @@ def run_bot():
                                 'market': market_question, 
                                 'prob': base_prob,
                                 'meta_prob': meta_prob,
+                                'regime': regime_id,
                                 'side': side, 
                                 'price': best_ask, 
                                 'liquidity': size_available, 
