@@ -19,11 +19,11 @@ KMEANS_SCALER_PATH = 'kmeans_scaler.pkl'
 LOG_FILE = 'paper_trades_log.csv'
 
 # Thresholds aus Backtest-Optimierung
-CONFIDENCE_THRESHOLD = 0.580    # Basis-Modell Threshold
+CONFIDENCE_THRESHOLD = 0.570    # Basis-Modell Threshold
 META_THRESHOLD = 0.580          # Meta-Modell (Risk Manager) Threshold
 REGIME_BLOCK_ID = 3             # Regime ID, die blockiert wird (Panik/Hohe Vola)
 
-FRACTIONAL_KELLY = 0.25         # Quarter-Kelly
+BET_FRACTION = 0.02             # Fixes Position Sizing (2% des Kapitals)
 INITIAL_CAPITAL = 10000.0
 
 # API Endpoints
@@ -236,111 +236,127 @@ def run_bot():
         pd.DataFrame(columns=cols).to_csv(LOG_FILE, index=False)
 
     while True:
-        now = datetime.now()
-        print(f"\n--- ⏱️ Live Check: {now.strftime('%Y-%m-%d %H:%M:%S')} ---")
-        
-        # 1. Daten holen
-        df_binance = fetch_binance_5m()
-        df_onchain = fetch_mempool_onchain_history()
-        
-        if df_binance is None or df_onchain is None:
-            time.sleep(10)
-            continue
+        try:
+            now = datetime.now()
+            print(f"\n--- ⏱️ Live Check: {now.strftime('%Y-%m-%d %H:%M:%S')} ---")
             
-        current_btc_price = df_binance.iloc[-1]['close']
-        
-        # 2. Trade Resolution
-        resolve_trades(current_btc_price)
-        
-        # 3. Features berechnen
-        row_live, base_features, regime_features = calculate_live_features(df_binance, df_onchain)
-        
-        # 4. Inferenz Stufe 1: Basis-Modell
-        X_scaled = scaler.transform(row_live[base_features].values)
-        base_prob = base_model.predict_proba(X_scaled)[:, 1][0]
-        print(f"🔮 Basis-Modell (UP): {base_prob:.2%}")
-        
-        # 5. Signal & Risk Management (Triple-Check)
-        if base_prob > CONFIDENCE_THRESHOLD:
+            # 1. Daten holen
+            df_binance = fetch_binance_5m()
+            df_onchain = fetch_mempool_onchain_history()
             
-            # Stufe 2: Regime Filter
-            X_regime = kmeans_scaler.transform(row_live[regime_features].values)
-            regime_id = kmeans_model.predict(X_regime)[0]
-            print(f"🌐 Markt-Regime: {regime_id} {'⚠️ (PANIK/BLOCK)' if regime_id == REGIME_BLOCK_ID else '✅ (NORMAL)'}")
-            
-            if regime_id == REGIME_BLOCK_ID:
-                print(f"🛑 Regime-Filter blockiert Trade (Regime {regime_id})")
-                time.sleep(30)
+            if df_binance is None or df_onchain is None:
+                time.sleep(10)
                 continue
                 
-            # Stufe 3: Meta-Modell (Risk Manager)
-            meta_features = [
-                'atr_14', 'volume', 'volatility_20', 'volatility_60', 
-                'dist_to_bb_upper', 'dist_to_bb_lower',
-                'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg'
-            ]
-            # Meta-Features vorbereiten (base_prob hinzufügen)
-            X_meta_dict = row_live[meta_features].to_dict('records')[0]
-            X_meta_dict['base_prob'] = base_prob
+            current_btc_price = df_binance.iloc[-1]['close']
             
-            # Sortierung der Features für Meta-Modell sicherstellen (muss 1:1 wie im Training sein)
-            meta_feature_order = [
-                'base_prob', 'atr_14', 'volume', 'volatility_20', 'volatility_60', 
-                'dist_to_bb_upper', 'dist_to_bb_lower',
-                'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg'
-            ]
-            X_meta_values = np.array([[X_meta_dict[f] for f in meta_feature_order]])
+            # 2. Trade Resolution
+            resolve_trades(current_btc_price)
             
-            meta_prob = meta_model.predict_proba(X_meta_values)[:, 1][0]
-            print(f"🛡️ Risk Manager Konfidenz: {meta_prob:.2%}")
+            # 3. Features berechnen
+            row_live, base_features, regime_features = calculate_live_features(df_binance, df_onchain)
             
-            if meta_prob > META_THRESHOLD:
-                # Polymarket Check
-                markets = get_active_btc_markets()
-                for market in markets:
-                    market_question = market['question']
-                    token_ids = market.get('clobTokenIds', [])
-                    if len(token_ids) < 2: continue
+            # Sicherheitscheck für NaN/Inf
+            if row_live[base_features].isnull().values.any() or np.isinf(row_live[base_features].values).any():
+                print("⚠️ Warnung: Ungültige Daten (NaN/Inf) in Base-Features. Überspringe Zyklus.")
+                time.sleep(10)
+                continue
+            
+            # 4. Inferenz Stufe 1: Basis-Modell
+            X_scaled = scaler.transform(row_live[base_features].values)
+            base_prob = base_model.predict_proba(X_scaled)[:, 1][0]
+            print(f"🔮 Basis-Modell (UP): {base_prob:.2%}")
+            
+            # 5. Signal & Risk Management (Triple-Check)
+            if base_prob > CONFIDENCE_THRESHOLD:
+                
+                # Stufe 2: Regime Filter
+                X_regime = kmeans_scaler.transform(row_live[regime_features].values)
+                regime_id = kmeans_model.predict(X_regime)[0]
+                print(f"🌐 Markt-Regime: {regime_id} {'⚠️ (PANIK/BLOCK)' if regime_id == REGIME_BLOCK_ID else '✅ (NORMAL)'}")
+                
+                if regime_id == REGIME_BLOCK_ID:
+                    print(f"🛑 Regime-Filter blockiert Trade (Regime {regime_id})")
+                    time.sleep(30)
+                    continue
                     
-                    token_id, side = token_ids[0], "YES"
-                    book = get_live_orderbook(token_id)
-                    
-                    if book and book.get('asks'):
-                        best_ask = float(book['asks'][0]['price'])
-                        size_available = float(book['asks'][0]['size'])
+                # Stufe 3: Meta-Modell (Risk Manager)
+                meta_features = [
+                    'atr_14', 'volume', 'volatility_20', 'volatility_60', 
+                    'dist_to_bb_upper', 'dist_to_bb_lower',
+                    'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg'
+                ]
+                # Meta-Features vorbereiten (base_prob hinzufügen)
+                X_meta_dict = row_live[meta_features].to_dict('records')[0]
+                X_meta_dict['base_prob'] = base_prob
+                
+                # Sortierung der Features für Meta-Modell sicherstellen (muss 1:1 wie im Training sein)
+                meta_feature_order = [
+                    'base_prob', 'atr_14', 'volume', 'volatility_20', 'volatility_60', 
+                    'dist_to_bb_upper', 'dist_to_bb_lower',
+                    'fee_momentum_ratio', 'tx_1h_sum', 'blocksize_1h_avg'
+                ]
+                X_meta_values = np.array([[X_meta_dict[f] for f in meta_feature_order]])
+                
+                meta_prob = meta_model.predict_proba(X_meta_values)[:, 1][0]
+                print(f"🛡️ Risk Manager Konfidenz: {meta_prob:.2%}")
+                
+                if meta_prob > META_THRESHOLD:
+                    # Polymarket Check
+                    markets = get_active_btc_markets()
+                    for market in markets:
+                        market_question = market['question']
+                        token_ids = market.get('clobTokenIds', [])
+                        if len(token_ids) < 2: continue
                         
-                        # Kelly (EV Check)
-                        b = (1.0 - best_ask) / (best_ask + 1e-8)
-                        q = 1.0 - base_prob
-                        kelly_pct = (base_prob * b - q) / (b + 1e-8)
-                        bet_amount = capital * min(max(kelly_pct * FRACTIONAL_KELLY, 0), 0.15) # Cap auf 15% erhöht wie im Backtest
+                        token_id, side = token_ids[0], "YES"
+                        book = get_live_orderbook(token_id)
                         
-                        if bet_amount > 0 and (size_available * best_ask) >= bet_amount:
-                            print(f"🎯 TRADING SIGNAL! {side} @ {best_ask} for {market_question}")
-                            log_entry = {
-                                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                'market': market_question, 
-                                'prob': base_prob,
-                                'meta_prob': meta_prob,
-                                'regime': regime_id,
-                                'side': side, 
-                                'price': best_ask, 
-                                'liquidity': size_available, 
-                                'kelly_bet': bet_amount,
-                                'entry_btc_price': current_btc_price,
-                                'exit_price': 0.0,
-                                'status': 'OPEN',
-                                'pnl': 0.0
-                            }
-                            pd.DataFrame([log_entry]).to_csv(LOG_FILE, mode='a', header=False, index=False)
-                            print(f"📝 Paper-Trade geloggt! (Entry BTC: {current_btc_price})")
-                        else:
-                            print(f"💤 Signal vorhanden, aber Liquidität zu gering oder kein EV.")
-            else:
-                print(f"⚠️ Risk Manager blockiert Trade (Konfidenz {meta_prob:.2%} <= {META_THRESHOLD:.2%})")
-        
-        # Nächster Check in 30 Sekunden
-        time.sleep(30)
+                        if book and book.get('asks'):
+                            best_ask = float(book['asks'][0]['price'])
+                            size_available = float(book['asks'][0]['size'])
+                            
+                            # Dynamisches Compounding berechnen (Basis + PnL aller Trades)
+                            try:
+                                df_log = pd.read_csv(LOG_FILE)
+                                realized_pnl = df_log[df_log['status'].isin(['WON', 'LOST'])]['pnl'].sum()
+                                current_capital = INITIAL_CAPITAL + realized_pnl
+                            except:
+                                current_capital = INITIAL_CAPITAL
+                            
+                            # Position Sizing: Fixed % (z.B. 2%)
+                            bet_amount = current_capital * BET_FRACTION
+                            
+                            if bet_amount > 0 and (size_available * best_ask) >= bet_amount:
+                                print(f"🎯 TRADING SIGNAL! {side} @ {best_ask} for {market_question}")
+                                log_entry = {
+                                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                    'market': market_question, 
+                                    'prob': base_prob,
+                                    'meta_prob': meta_prob,
+                                    'regime': regime_id,
+                                    'side': side, 
+                                    'price': best_ask, 
+                                    'liquidity': size_available, 
+                                    'kelly_bet': bet_amount,
+                                    'entry_btc_price': current_btc_price,
+                                    'exit_price': 0.0,
+                                    'status': 'OPEN',
+                                    'pnl': 0.0
+                                }
+                                pd.DataFrame([log_entry]).to_csv(LOG_FILE, mode='a', header=False, index=False)
+                                print(f"📝 Paper-Trade geloggt! (Entry BTC: {current_btc_price})")
+                            else:
+                                print(f"💤 Signal vorhanden, aber Liquidität zu gering oder kein EV.")
+                else:
+                    print(f"⚠️ Risk Manager blockiert Trade (Konfidenz {meta_prob:.2%} <= {META_THRESHOLD:.2%})")
+            
+            # Nächster Check in 30 Sekunden
+            time.sleep(30)
+            
+        except Exception as e:
+            print(f"❌ Unerwarteter Fehler im Main-Loop: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
     try:

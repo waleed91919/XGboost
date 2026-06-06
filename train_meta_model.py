@@ -35,8 +35,12 @@ def calculate_all_features(df):
 
     # --- Mikrostruktur (für Basis-Modell) ---
     df['typical_price'] = (high + low + close) / 3
-    # VWAP (Intraday style approximation)
-    df['vwap'] = (df['typical_price'] * df['volume']).cumsum() / df['volume'].cumsum()
+    # VWAP (Intraday)
+    df['date_only'] = df.index.date
+    daily_groups = df.groupby('date_only')
+    df['cum_vol'] = daily_groups['volume'].cumsum()
+    df['cum_vol_price'] = daily_groups.apply(lambda x: (x['typical_price'] * x['volume']).cumsum()).reset_index(level=0, drop=True)
+    df['vwap'] = df['cum_vol_price'] / df['cum_vol']
     df['dist_to_vwap'] = (close - df['vwap']) / df['vwap']
 
     # MFI

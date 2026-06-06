@@ -162,7 +162,8 @@ def main():
         return
 
     if not os.path.exists(LOG_FILE):
-        pd.DataFrame(columns=['timestamp', 'market', 'prob', 'side', 'price', 'liquidity', 'kelly_bet']).to_csv(LOG_FILE, index=False)
+        cols = ['timestamp', 'market', 'prob', 'meta_prob', 'regime', 'side', 'price', 'liquidity', 'kelly_bet', 'entry_btc_price', 'exit_price', 'status', 'pnl']
+        pd.DataFrame(columns=cols).to_csv(LOG_FILE, index=False)
 
     # 2. Daten holen
     try:
@@ -217,8 +218,21 @@ def main():
             
             if bet_amount > 0 and (size_available * best_ask) >= bet_amount:
                 print(f"🎯 SIGNAL! {side} @ {best_ask} for {market_question}")
-                log_entry = {'timestamp': datetime.now(), 'market': market_question, 'prob': confidence,
-                             'side': side, 'price': best_ask, 'liquidity': size_available, 'kelly_bet': bet_amount}
+                log_entry = {
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'market': market_question,
+                    'prob': confidence,
+                    'meta_prob': 0.0,
+                    'regime': -1,
+                    'side': side,
+                    'price': best_ask,
+                    'liquidity': size_available,
+                    'kelly_bet': bet_amount,
+                    'entry_btc_price': df_binance.iloc[-1]['close'] if df_binance is not None else 0.0,
+                    'exit_price': 0.0,
+                    'status': 'OPEN',
+                    'pnl': 0.0
+                }
                 pd.DataFrame([log_entry]).to_csv(LOG_FILE, mode='a', header=False, index=False)
                 found_trade = True
 
